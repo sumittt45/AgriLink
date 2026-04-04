@@ -1,0 +1,190 @@
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- FIX_FARMER_LISTINGS.sql
+-- Run in: Supabase Dashboard → SQL Editor → New Query → Paste → Run
+--
+-- Fixes:
+--   1. Farmer can't publish crop listings  (missing GRANT INSERT on crop_listings)
+--   2. Farmer profile blank after registration (missing GRANT INSERT/UPDATE on farmers,
+--      missing columns: profile_image_url, phone_number, crop_types, state, city)
+--   3. Auto-create of farmers row fails on dashboard load (same missing GRANTs)
+--   4. Backfills existing farmers who have empty/missing rows
+--
+-- Safe to re-run — all statements are idempotent.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+
+-- ── PART 1: Grant missing write permissions ───────────────────────────────────
+-- PostgreSQL checks table-level GRANTs BEFORE RLS policies.
+-- Without INSERT/UPDATE, operations fail even if RLS would allow them.
+
+GRANT INSERT, UPDATE         ON public.farmers       TO authenticated;
+GRANT INSERT, UPDATE, DELETE ON public.crop_listings TO authenticated;
+
+
+-- ── PART 2: Add missing columns to farmers table ─────────────────────────────
+-- These columns are needed by FarmerDashboard and the registration flow.
+
+ALTER TABLE public.farmers
+  ADD COLUMN IF NOT EXISTS profile_image_url  TEXT,
+  ADD COLUMN IF NOT EXISTS government_id_url  TEXT,
+  ADD COLUMN IF NOT EXISTS phone_number       TEXT,
+  ADD COLUMN IF NOT EXISTS crop_types         TEXT,
+  ADD COLUMN IF NOT EXISTS state              TEXT,
+  ADD COLUMN IF NOT EXISTS city               TEXT;
+
+
+-- ── PART 3: Update handle_new_user trigger ────────────────────────────────────
+-- Stores all registration metadata (profile image, phone, crop types, etc.)
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_role  app_role;
+  v_name  TEXT;
+BEGIN
+  v_role := CASE
+    WHEN lower(trim(NEW.raw_user_meta_data->>'role')) = 'farmer' THEN 'farmer'::app_role
+    ELSE 'buyer'::app_role
+  END;
+
+  v_name := COALESCE(
+    NULLIF(trim(NEW.raw_user_meta_data->>'name'), ''),
+    NULLIF(trim(NEW.raw_user_meta_data->>'full_name'), ''),
+    ''
+  );
+
+  -- profiles row (uses id = auth.users.id, standard Supabase pattern)
+  INSERT INTO public.profiles (id, name, email, phone)
+  VALUES (
+    NEW.id,
+    v_name,
+    NEW.email,
+    NULLIF(trim(NEW.raw_user_meta_data->>'phone'), '')
+  )
+  ON CONFLICT (id) DO NOTHING;
+
+  -- user_roles row
+  INSERT INTO public.user_roles (user_id, role)
+  VALUES (NEW.id, v_role)
+  ON CONFLICT (user_id, role) DO NOTHING;
+
+  -- farmers row (only for farmer registrations)
+  IF v_role = 'farmer' THEN
+    INSERT INTO public.farmers (
+      user_id, farm_name, location, state, city, farm_size,
+      profile_image_url, government_id_url, phone_number, crop_types
+    ) VALUES (
+      NEW.id,
+      COALESCE(NULLIF(trim(NEW.raw_user_meta_data->>'farm_name'), ''), v_name || '''s Farm'),
+      COALESCE(NULLIF(trim(NEW.raw_user_meta_data->>'location'),  ''), ''),
+      NULLIF(trim(NEW.raw_user_meta_data->>'state'), ''),
+      NULLIF(trim(NEW.raw_user_meta_data->>'city'),  ''),
+      NULLIF(trim(NEW.raw_user_meta_data->>'farm_size'), '')::NUMERIC,
+      NULLIF(trim(NEW.raw_user_meta_data->>'profile_image_url'), ''),
+      NULLIF(trim(NEW.raw_user_meta_data->>'government_id_url'), ''),
+      NULLIF(trim(NEW.raw_user_meta_data->>'phone'), ''),
+      NULLIF(trim(NEW.raw_user_meta_data->>'crop_types'), '')
+    )
+    ON CONFLICT (user_id) DO UPDATE SET
+      farm_name         = EXCLUDED.farm_name,
+      location          = EXCLUDED.location,
+      state             = EXCLUDED.state,
+      city              = EXCLUDED.city,
+      farm_size         = COALESCE(EXCLUDED.farm_size,         public.farmers.farm_size),
+      profile_image_url = COALESCE(EXCLUDED.profile_image_url, public.farmers.profile_image_url),
+      government_id_url = COALESCE(EXCLUDED.government_id_url, public.farmers.government_id_url),
+      phone_number      = COALESCE(EXCLUDED.phone_number,      public.farmers.phone_number),
+      crop_types        = COALESCE(EXCLUDED.crop_types,        public.farmers.crop_types),
+      updated_at        = now();
+  END IF;
+
+  RETURN NEW;
+
+EXCEPTION WHEN OTHERS THEN
+  RAISE LOG 'handle_new_user failed for user % — % (%)', NEW.id, SQLERRM, SQLSTATE;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+
+-- Ensure trigger is attached
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'on_auth_user_created'
+  ) THEN
+    CREATE TRIGGER on_auth_user_created
+      AFTER INSERT ON auth.users
+      FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+  END IF;
+END;
+$$;
+
+
+-- ── PART 4: Backfill existing farmers ────────────────────────────────────────
+-- Updates farmers with empty fields from their auth metadata.
+
+UPDATE public.farmers f
+SET
+  profile_image_url = COALESCE(NULLIF(f.profile_image_url, ''), NULLIF(u.raw_user_meta_data->>'profile_image_url', '')),
+  phone_number      = COALESCE(NULLIF(f.phone_number, ''),      NULLIF(u.raw_user_meta_data->>'phone', '')),
+  crop_types        = COALESCE(NULLIF(f.crop_types, ''),        NULLIF(u.raw_user_meta_data->>'crop_types', '')),
+  state             = COALESCE(NULLIF(f.state, ''),             NULLIF(u.raw_user_meta_data->>'state', '')),
+  city              = COALESCE(NULLIF(f.city, ''),              NULLIF(u.raw_user_meta_data->>'city', '')),
+  farm_name         = CASE
+    WHEN NULLIF(TRIM(f.farm_name), '') IS NULL
+    THEN COALESCE(
+      NULLIF(TRIM(u.raw_user_meta_data->>'farm_name'), ''),
+      NULLIF(TRIM(u.raw_user_meta_data->>'name'), '') || '''s Farm',
+      'My Farm'
+    )
+    ELSE f.farm_name
+  END
+FROM auth.users u
+WHERE f.user_id = u.id;
+
+-- Create farmers rows for users with role='farmer' who have no row yet
+INSERT INTO public.farmers (
+  user_id, farm_name, location, state, city,
+  farm_size, profile_image_url, government_id_url,
+  phone_number, crop_types, verified_status
+)
+SELECT
+  u.id,
+  COALESCE(
+    NULLIF(TRIM(u.raw_user_meta_data->>'farm_name'), ''),
+    NULLIF(TRIM(u.raw_user_meta_data->>'name'), '') || '''s Farm',
+    'My Farm'
+  ),
+  COALESCE(NULLIF(TRIM(u.raw_user_meta_data->>'location'), ''), ''),
+  NULLIF(TRIM(u.raw_user_meta_data->>'state'), ''),
+  NULLIF(TRIM(u.raw_user_meta_data->>'city'),  ''),
+  NULLIF(TRIM(u.raw_user_meta_data->>'farm_size'), '')::NUMERIC,
+  NULLIF(TRIM(u.raw_user_meta_data->>'profile_image_url'), ''),
+  NULLIF(TRIM(u.raw_user_meta_data->>'government_id_url'), ''),
+  NULLIF(TRIM(u.raw_user_meta_data->>'phone'), ''),
+  NULLIF(TRIM(u.raw_user_meta_data->>'crop_types'), ''),
+  false
+FROM auth.users u
+JOIN public.user_roles r ON r.user_id = u.id AND r.role = 'farmer'
+WHERE NOT EXISTS (
+  SELECT 1 FROM public.farmers f2 WHERE f2.user_id = u.id
+);
+
+
+-- ── PART 5: Ensure RLS policies exist for farmers ────────────────────────────
+
+ALTER TABLE public.farmers ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Farmers can insert own record" ON public.farmers;
+CREATE POLICY "Farmers can insert own record"
+  ON public.farmers FOR INSERT
+  WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Farmers can update own record" ON public.farmers;
+CREATE POLICY "Farmers can update own record"
+  ON public.farmers FOR UPDATE
+  USING (auth.uid() = user_id);
+
+
+-- ── Reload PostgREST schema cache ─────────────────────────────────────────────
+SELECT pg_notify('pgrst', 'reload schema');
